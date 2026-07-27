@@ -1,0 +1,20 @@
+[package]
+name = "payment-processor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.71"
+description = "Mini payment processor REST API"
+
+[dependencies]
+actix-web = "4"
+chrono = { version = "0.4", features = ["serde"] }
+env_logger = "0.11"
+log = "0.4"
+rust_decimal = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+actix-http = "3"
+serde_json = "1"
