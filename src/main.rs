@@ -1,0 +1,43 @@
+mod errors;
+mod handlers;
+mod models;
+mod state;
+
+use actix_web::{middleware::Logger, web, App, HttpServer};
+
+use crate::errors::ApiError;
+use crate::state::AppData;
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+
+    // One shared state instance; `web::Data` wraps it in an `Arc`, so every
+    // worker thread operates on the same clients and counters.
+    let data = web::Data::new(AppData::default());
+
+    log::info!("payment processor listening on http://127.0.0.1:8080");
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(data.clone())
+            // Malformed JSON bodies / query strings would otherwise return
+            // actix's plain-text 400; route them through `ApiError` so every
+            // error response shares the same JSON shape.
+            .app_data(web::JsonConfig::default().error_handler(|err, _req| {
+                ApiError::Validation(err.to_string()).into()
+            }))
+            .app_data(web::QueryConfig::default().error_handler(|err, _req| {
+                ApiError::Validation(err.to_string()).into()
+            }))
+            .wrap(Logger::default())
+            .service(handlers::new_client)
+            .service(handlers::new_credit_transaction)
+            .service(handlers::new_debit_transaction)
+            .service(handlers::store_balances)
+            .service(handlers::client_balance)
+    })
+    .bind(("127.0.0.1", 8080))?
+    .run()
+    .await
+}
