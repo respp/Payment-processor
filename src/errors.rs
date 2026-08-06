@@ -9,8 +9,11 @@ use thiserror::Error;
 /// and a machine-readable error code.
 #[derive(Debug, Error)]
 pub enum ApiError {
-    #[error("{0}")]
-    Validation(String),
+    /// One or more request fields failed validation. Carries every problem
+    /// found, not just the first — see `validation::Validate`.
+    // ! FEEDBACK 5: Validation(String) -> Validation(Vec<String>), agrupa todos los errores de una request
+    #[error("{}", .0.join("; "))]
+    Validation(Vec<String>),
 
     #[error("client {0} does not exist")]
     ClientNotFound(u32),
