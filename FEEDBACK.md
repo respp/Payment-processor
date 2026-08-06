@@ -90,6 +90,18 @@ plano**, no JSON, y no arma ningún campo `error`/`message`. Si se sacara
 `ErrorBody`, las respuestas de error dejarían de ser JSON estructurado y romperían
 cualquier cliente que hoy parsea `{"error": ..., "message": ...}`.
 
+**Fuente oficial:** documentación pública de `ResponseError` en docs.rs (no sólo el
+source local), vigente para la versión actual:
+<https://docs.rs/actix-web/latest/actix_web/error/trait.ResponseError.html>
+
+> `error_response()` — "Creates full response for error." "By default, the
+> generated response uses a 500 Internal Server Error status code, a `Content-Type`
+> of `text/plain`, and the body is set to `Self`'s `Display` impl."
+
+Es decir: sin `ErrorBody`, el default de Actix ni siquiera arma un objeto — devuelve
+`text/plain` con lo que sea que imprima tu `Display`. Ningún campo `error`/`message`
+existe salvo que vos los construyas, que es exactamente lo que hace `ErrorBody`.
+
 **¿Dónde mejoró?** **No se aplicó ningún cambio** — la premisa del feedback es
 factualmente errónea, verificada contra el source de la librería. Vale la pena
 transmitirle esto al recruiter con la referencia al archivo fuente.
@@ -167,6 +179,41 @@ gap real más grande del proyecto.
 - El split de locks **no se aplicó** — se documentó en código por qué no
   corresponde, en vez de aplicar un cambio que hubiese sido un paso atrás.
 
+**Fuentes oficiales y precisión adicional** (revisión posterior, con Gemini de por
+medio — ver abajo):
+
+- La propuesta original, literal, era *"un `Arc<>` simple, sin lock de escritura
+  compartido"*. Eso es imposible en Rust para algo que se muta desde varios
+  threads (`documents` se inserta en cada `create_client` concurrente). La propia
+  documentación de `Arc` lo dice explícitamente:
+  <https://doc.rust-lang.org/std/sync/struct.Arc.html>
+  > "Shared references in Rust disallow mutation by default, and `Arc` is no
+  > exception: you cannot generally obtain a mutable reference to something
+  > inside an `Arc`. If you do need to mutate through an `Arc`, you have several
+  > options: 1. Use interior mutability with synchronization primitives like
+  > `Mutex`, `RwLock`, or one of the `Atomic` types [...]"
+  Un `Arc<HashSet<String>>` a secas sólo sirve si `documents` nunca se
+  modifica después de creado — no es el caso acá. Siempre hace falta algún tipo
+  de lock o atómico por dentro; "Arc simple, sin lock" no es una opción real.
+
+- Sobre "al escribir en uno se bloquea el acceso al otro innecesariamente":
+  esto es **técnicamente correcto tal como está el código hoy**, y conviene
+  reconocerlo en vez de restarle validez. `ClientRegistry` guarda `clients` y
+  `documents` como campos planos detrás de un único `RwLock<ClientRegistry>`, así
+  que tomar el write guard para tocar `clients` de hecho bloquea cualquier acceso
+  a `documents` también (y viceversa) — dos `RwLock` independientes, uno por
+  campo, no se bloquearían entre sí. Esa parte de la crítica original es válida
+  en términos de mecánica de Rust.
+  Lo que no cambia es la conclusión práctica: con `grep -rn "\.documents" src/`
+  se confirma que `documents` tiene un único call site en todo el proyecto
+  (`create_client`), y ahí siempre se usa junto con `clients` en la misma
+  operación atómica (evitar la race de documento duplicado). No existe ningún
+  camino donde un thread quiera tocar sólo `documents` mientras otro toca sólo
+  `clients` — así que separar los locks eliminaría un bloqueo que en la práctica
+  nunca ocurre, a costa de mantener dos locks en vez de uno. Es un trade-off real
+  (correcto en abstracto, sin beneficio concreto acá), no un error de la crítica
+  original como lo había planteado antes.
+
 ---
 
 ## 7. `std::sync::RwLock` en vez de `tokio::sync::RwLock`
@@ -197,19 +244,93 @@ espera async.
 sin necesidad real, justo lo contrario de lo que dice la documentación oficial
 de tokio. Se agregó un comentario en `src/state.rs` (marcado `FEEDBACK 7`)
 documentando por qué `std::sync::RwLock` es la elección correcta, para que
-quede explícito y no como un descuido. Vale la pena citarle al recruiter la
-doc de tokio si este punto vuelve a salir.
+quede explícito y no como un descuido.
+
+**Fuentes oficiales** (documentación pública vigente, no sólo comentarios del
+source):
+
+1. Docs de la API, `tokio::sync::Mutex` (el mismo módulo que expone `RwLock`, y
+   ahí es donde tokio explica la regla general para todo `tokio::sync`):
+   <https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html>
+   > "it is ok and often preferred to use the ordinary standard library Mutex in
+   > asynchronous code." [...] "The primary use case for the async mutex is to
+   > provide shared mutable access to IO resources such as a database
+   > connection." [...] "If the value behind the mutex is just data, it's
+   > usually appropriate to use a blocking mutex such as the one in
+   > `std::sync`."
+
+2. Tutorial oficial de tokio.rs, capítulo "Shared State" — construye
+   exactamente el mismo patrón que este proyecto (un `HashMap` compartido detrás
+   de un lock, en un servidor async) y usa `std::sync::Mutex` a propósito:
+   <https://tokio.rs/tokio/tutorial/shared-state>
+   > "Note that `std::sync::Mutex` and not `tokio::sync::Mutex` is used to guard
+   > the `HashMap`." [...] "using a synchronous mutex from within asynchronous
+   > code is fine as long as contention remains low and the lock is not held
+   > across calls to `.await`."
+
+La regla real, según la propia documentación de tokio, es la inversa de lo que
+dice el feedback: el lock bloqueante de `std` es la opción **preferida** para
+datos en memoria; el lock async de `tokio::sync` es la excepción, reservada para
+cuando el guard tiene que sobrevivir a un `.await` (típicamente recursos de I/O).
+Este proyecto no tiene ningún `async fn` en `AppData` ni mantiene el guard vivo
+a través de un `.await` en ningún lado, así que cae exactamente en el caso que
+tokio recomienda resolver con `std::sync`.
+
+---
+
+## Contraste con una segunda opinión (Gemini)
+
+Antes de responder al recruiter, contrastamos los puntos en desacuerdo (4, 6 y 7)
+con la opinión de otro modelo (Gemini). Vale la pena separar dónde tiene razón y
+dónde no, en vez de descartarla o aceptarla en bloque.
+
+**Dónde Gemini acierta:**
+- Punto 6, sub-punto "Arc simple sin lock": tiene razón, y es un ángulo que no
+  había cubierto antes — un `Arc<T>` a secas no permite mutar `T` desde varios
+  threads: la propuesta original de la revisión ("Arc simple, sin lock de
+  escritura compartido") es imposible tal como está escrita, según la propia doc
+  de `Arc` citada arriba. Ya está incorporado a la sección del punto 6.
+- Punto 6, sub-punto "un lock bloquea el acceso al otro": tiene razón en la
+  mecánica general de Rust (dos `RwLock` independientes no se bloquean entre
+  sí) y, aplicado a nuestro código actual, la observación es técnicamente
+  correcta (compartimos un único `RwLock<ClientRegistry>`). Ya está reconocido
+  arriba — la defensa sigue en pie, pero por el argumento de "cero contención
+  real" (grep), no porque la premisa fuera falsa.
+- Punto 5, sobre `Result<Self, ApiError>`/"parse, don't validate": es un patrón
+  legítimo y muy usado en Rust (crates como `garde` o `validator` lo
+  implementan). No es un error señalarlo. La razón por la que no lo usamos tal
+  cual es otra: una conversión `TryFrom`/`Result<Self, E>` "ingenua" corta en el
+  primer campo inválido, que es justo lo que el *mismo* punto 5 pedía evitar.
+  Se puede hacer un "parse don't validate" que acumule errores (es lo que hacen
+  `garde`/`validator`), pero en la práctica termina siendo la misma forma que
+  ya tenemos: validar devuelve todos los errores, y sólo después se construye el
+  valor normalizado — con nombres distintos, mismo diseño de fondo.
+
+**Dónde la opinión de Gemini es imprecisa (punto 7):**
+Gemini concede el punto 7 al reviewer diciendo que `tokio::sync::RwLock` es "la
+opción por defecto adecuada" en handlers de Actix/Tokio, y que `std::sync` sólo
+vale si el guard queda aislado en un bloque corto sin `.await`. Esa afirmación
+invierte el orden que la propia documentación de tokio establece: según
+docs.rs, el lock bloqueante de `std` es la opción **por defecto/preferida**
+para datos en memoria, y el lock async es la excepción reservada para guards
+que cruzan un `.await` (típicamente I/O). Es la relación "default vs. excepción"
+al revés de como la plantea Gemini.
+Dicho esto, la condición que Gemini pone (guard que nunca cruza un `.await`) es
+exactamente la que cumple este proyecto — así que, aunque el marco que usa
+Gemini para explicarlo está invertido respecto a la doc oficial, al aplicar su
+propia condición al código real, termina validando la misma conclusión: acá
+`std::sync::RwLock` es correcto, no un error grave.
 
 ---
 
 ## Resumen
 
-| # | Punto | Estado |
-|---|-------|--------|
-| 1 | Organización del proyecto | ✅ Aplicado completo |
-| 2 | Documentación | ⏸️ No resuelto (decisión de no continuar) |
-| 3 | `main.rs` / `app_data` clone | ✅ Aclarado (ya era correcto) |
-| 4 | `ErrorBody` innecesario | ❌ Rechazado (premisa incorrecta, verificado en source) |
-| 5 | Validación | ✅ Aplicado completo |
-| 6 | Diseño de `AppState` | ✅ Parcial (nombre sí, split de locks no) |
-| 7 | `std::sync` vs `tokio::sync` `RwLock` | ❌ Rechazado (premisa incorrecta, verificado en source) |
+| # | Punto | Estado | Fuente oficial |
+|---|-------|--------|-----------------|
+| 1 | Organización del proyecto | ✅ Aplicado completo | — |
+| 2 | Documentación | ⏸️ No resuelto (decisión de no continuar) | — |
+| 3 | `main.rs` / `app_data` clone | ✅ Aclarado (ya era correcto) | — |
+| 4 | `ErrorBody` innecesario | ❌ Rechazado | [docs.rs `ResponseError`](https://docs.rs/actix-web/latest/actix_web/error/trait.ResponseError.html) |
+| 5 | Validación | ✅ Aplicado completo | — |
+| 6 | Diseño de `AppState` | ✅ Parcial (nombre sí, split de locks no) | [std `Arc` docs](https://doc.rust-lang.org/std/sync/struct.Arc.html) |
+| 7 | `std::sync` vs `tokio::sync` `RwLock` | ❌ Rechazado | [docs.rs `tokio::sync::Mutex`](https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html), [tokio.rs tutorial](https://tokio.rs/tokio/tutorial/shared-state) |
