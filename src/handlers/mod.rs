@@ -1,101 +1,24 @@
-//! HTTP handlers. Kept thin: validate input, delegate to `AppData`, shape
-//! the response. All locking lives in `state`, all status codes in `errors`.
+//! HTTP handlers, grouped by feature. Kept thin: validate input, delegate to
+//! `AppData`, shape the response. All locking lives in `state`, all status
+//! codes in `errors`.
 
-use actix_web::{get, post, web, HttpResponse};
-use chrono::Local;
+// ! FEEDBACK 1: handlers.rs (un solo archivo) se dividió en handlers/{clients,transactions,balances}.rs
+pub mod balances;
+pub mod clients;
+pub mod transactions;
 
-use crate::errors::ApiError;
-use crate::models::{
-    validate_amount, BalanceResponse, ClientBalanceQuery, CreditRequest, DebitRequest,
-    NewClientRequest, NewClientResponse, StoreBalancesResponse,
-};
-use crate::state::AppData;
-
-#[post("/new_client")]
-pub async fn new_client(
-    data: web::Data<AppData>,
-    body: web::Json<NewClientRequest>,
-) -> Result<HttpResponse, ApiError> {
-    let request = body.into_inner().validated()?;
-    let client_id = data.create_client(request)?;
-    Ok(HttpResponse::Created().json(NewClientResponse { client_id }))
-}
-
-#[post("/new_credit_transaction")]
-pub async fn new_credit_transaction(
-    data: web::Data<AppData>,
-    body: web::Json<CreditRequest>,
-) -> Result<HttpResponse, ApiError> {
-    let request = body.into_inner();
-    validate_amount("credit_amount", request.credit_amount)?;
-    let balance = data.credit(request.client_id, request.credit_amount)?;
-    Ok(HttpResponse::Ok().json(BalanceResponse {
-        client_id: request.client_id,
-        balance,
-    }))
-}
-
-#[post("/new_debit_transaction")]
-pub async fn new_debit_transaction(
-    data: web::Data<AppData>,
-    body: web::Json<DebitRequest>,
-) -> Result<HttpResponse, ApiError> {
-    let request = body.into_inner();
-    validate_amount("debit_amount", request.debit_amount)?;
-    let balance = data.debit(request.client_id, request.debit_amount)?;
-    Ok(HttpResponse::Ok().json(BalanceResponse {
-        client_id: request.client_id,
-        balance,
-    }))
-}
-
-/// Persists all balances to `DDMMYYYY_N.DAT` and resets them to zero.
-///
-/// Snapshot + reset happen atomically inside the lock; the (slow) file write
-/// happens *outside* it so transactions keep flowing during I/O. If the
-/// write fails, the drained amounts are credited back so money is never
-/// silently lost — debits attempted in that brief window may see a zero
-/// balance and be rejected, which is the safe failure mode.
-#[post("/store_balances")]
-pub async fn store_balances(data: web::Data<AppData>) -> Result<HttpResponse, ApiError> {
-    let snapshot = data.drain_balances()?;
-
-    let file_name = format!(
-        "{}_{}.DAT",
-        Local::now().format("%d%m%Y"),
-        data.next_file_sequence()
-    );
-
-    let mut contents = String::with_capacity(snapshot.len() * 16);
-    for (client_id, balance) in &snapshot {
-        contents.push_str(&format!("{client_id} {balance}\n"));
-    }
-
-    if let Err(io_error) = tokio::fs::write(&file_name, contents.as_bytes()).await {
-        data.restore_balances(&snapshot)?;
-        return Err(ApiError::Persistence(io_error));
-    }
-
-    Ok(HttpResponse::Ok().json(StoreBalancesResponse {
-        file_name,
-        clients_persisted: snapshot.len(),
-    }))
-}
-
-#[get("/client_balance")]
-pub async fn client_balance(
-    data: web::Data<AppData>,
-    query: web::Query<ClientBalanceQuery>,
-) -> Result<HttpResponse, ApiError> {
-    let client = data.get_client(query.user_id)?;
-    Ok(HttpResponse::Ok().json(client))
-}
+pub use balances::store_balances;
+pub use clients::{client_balance, new_client};
+pub use transactions::{new_credit_transaction, new_debit_transaction};
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use actix_web::{http::StatusCode, test, App};
+    use actix_web::{http::StatusCode, test, web, App};
     use serde_json::{json, Value};
+
+    use crate::state::AppData;
+
+    use super::*;
 
     async fn service() -> impl actix_web::dev::Service<
         actix_http::Request,
@@ -222,5 +145,33 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[actix_web::test]
+    async fn validation_reports_every_invalid_field_in_one_response() {
+        let app = service().await;
+
+        // Three independent problems in one request: blank name, blank
+        // document, and a birth date in the future. A consumer should be
+        // able to fix all three without round-tripping the API three times.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/new_client")
+                .set_json(json!({
+                    "client_name": "   ",
+                    "birth_date": "2999-01-01",
+                    "document_number": "   ",
+                    "country": "Argentina"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = test::read_body_json(resp).await;
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("client_name"));
+        assert!(message.contains("document_number"));
+        assert!(message.contains("birth_date"));
     }
 }

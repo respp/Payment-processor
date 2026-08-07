@@ -13,9 +13,24 @@ use rust_decimal::Decimal;
 use crate::errors::ApiError;
 use crate::models::{Client, NewClientRequest};
 
-/// Mutable application state, guarded by the `RwLock` in [`AppData`].
+/// The client registry: every registered client, plus the index that
+/// enforces document-number uniqueness. Guarded by the single `RwLock` in
+/// [`AppData`].
+///
+/// `clients` and `documents` deliberately share one lock instead of two.
+/// The only place that touches `documents` at all — for reads *or* writes —
+/// is [`AppData::create_client`], and it always touches both fields
+/// together: the uniqueness check and the client insert must happen under
+/// one guard, or two concurrent registrations with the same document number
+/// could both pass the check before either commits (a TOCTOU race). Splitting
+/// them into separate locks wouldn't remove any real contention — nothing
+/// else reads or writes `documents`, so `create_client` would still need to
+/// hold both locks for the same duration to keep that guarantee — while
+/// adding a second lock to order and reason about on every registration.
+/// One lock, one invariant to audit.
+// ! FEEDBACK 6: renombrado desde AppState (nombre demasiado genérico) a ClientRegistry
 #[derive(Default)]
-pub struct AppState {
+pub struct ClientRegistry {
     clients: HashMap<u32, Client>,
     /// Secondary index enforcing document-number uniqueness in O(1).
     /// Invariant: contains exactly the document numbers present in `clients`.
@@ -23,20 +38,22 @@ pub struct AppState {
 }
 
 /// Shared handle stored in `web::Data` (an `Arc<AppData>`), giving every
-/// worker thread the required `Arc<RwLock<AppState>>` view of the state.
+/// worker thread the required `Arc<RwLock<ClientRegistry>>` view of the
+/// state.
 ///
 /// Design notes:
-/// - The counters live *outside* the lock: they only need atomicity, not
-///   exclusive access to the whole state. `Relaxed` ordering suffices since
-///   uniqueness — not cross-thread happens-before — is the only guarantee
-///   we rely on.
+/// - The counters live *outside* the lock, as their own `AtomicU32` fields:
+///   they only need atomicity, not exclusive access to the registry.
+///   `Relaxed` ordering suffices since uniqueness — not cross-thread
+///   happens-before — is the only guarantee we rely on.
 /// - This is `std::sync::RwLock`, not tokio's: no guard is ever held across
 ///   an `.await`, and the critical sections are short and CPU-only, so a
 ///   brief blocking acquire is cheaper than async lock bookkeeping.
+// ! FEEDBACK 7: no se cambió a tokio::sync::RwLock — std::sync es lo correcto acá (ver doc arriba)
 pub struct AppData {
     next_client_id: AtomicU32,
     file_sequence: AtomicU32,
-    state: RwLock<AppState>,
+    registry: RwLock<ClientRegistry>,
 }
 
 impl Default for AppData {
@@ -44,7 +61,7 @@ impl Default for AppData {
         Self {
             next_client_id: AtomicU32::new(1),
             file_sequence: AtomicU32::new(1),
-            state: RwLock::new(AppState::default()),
+            registry: RwLock::new(ClientRegistry::default()),
         }
     }
 }
@@ -52,12 +69,12 @@ impl Default for AppData {
 impl AppData {
     /// Lock acquisition returns `Err` instead of panicking if a previous
     /// holder panicked (poisoned lock), keeping unwinds out of handlers.
-    fn read(&self) -> Result<RwLockReadGuard<'_, AppState>, ApiError> {
-        self.state.read().map_err(|_| ApiError::LockPoisoned)
+    fn read(&self) -> Result<RwLockReadGuard<'_, ClientRegistry>, ApiError> {
+        self.registry.read().map_err(|_| ApiError::LockPoisoned)
     }
 
-    fn write(&self) -> Result<RwLockWriteGuard<'_, AppState>, ApiError> {
-        self.state.write().map_err(|_| ApiError::LockPoisoned)
+    fn write(&self) -> Result<RwLockWriteGuard<'_, ClientRegistry>, ApiError> {
+        self.registry.write().map_err(|_| ApiError::LockPoisoned)
     }
 
     /// Registers a client and returns its generated ID.
@@ -67,15 +84,15 @@ impl AppData {
     /// pass the check. The ID is allocated only after the check succeeds,
     /// so rejected registrations never consume IDs.
     pub fn create_client(&self, req: NewClientRequest) -> Result<u32, ApiError> {
-        let mut state = self.write()?;
+        let mut registry = self.write()?;
 
-        if state.documents.contains(&req.document_number) {
+        if registry.documents.contains(&req.document_number) {
             return Err(ApiError::DuplicateDocument(req.document_number));
         }
 
         let client_id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
-        state.documents.insert(req.document_number.clone());
-        state.clients.insert(
+        registry.documents.insert(req.document_number.clone());
+        registry.clients.insert(
             client_id,
             Client {
                 client_id,
@@ -91,8 +108,8 @@ impl AppData {
 
     /// Adds `amount` to the client's balance and returns the new balance.
     pub fn credit(&self, client_id: u32, amount: Decimal) -> Result<Decimal, ApiError> {
-        let mut state = self.write()?;
-        let client = state
+        let mut registry = self.write()?;
+        let client = registry
             .clients
             .get_mut(&client_id)
             .ok_or(ApiError::ClientNotFound(client_id))?;
@@ -104,8 +121,8 @@ impl AppData {
     /// balance. Overdrafts are rejected; check and subtraction share one
     /// write guard so concurrent debits cannot both pass the funds check.
     pub fn debit(&self, client_id: u32, amount: Decimal) -> Result<Decimal, ApiError> {
-        let mut state = self.write()?;
-        let client = state
+        let mut registry = self.write()?;
+        let client = registry
             .clients
             .get_mut(&client_id)
             .ok_or(ApiError::ClientNotFound(client_id))?;
@@ -131,8 +148,8 @@ impl AppData {
     /// section, so no transaction can slip in between snapshot and reset.
     /// Returns the snapshot sorted by client ID for deterministic output.
     pub fn drain_balances(&self) -> Result<Vec<(u32, Decimal)>, ApiError> {
-        let mut state = self.write()?;
-        let mut snapshot: Vec<(u32, Decimal)> = state
+        let mut registry = self.write()?;
+        let mut snapshot: Vec<(u32, Decimal)> = registry
             .clients
             .values_mut()
             .map(|client| (client.client_id, mem::take(&mut client.balance)))
@@ -145,9 +162,9 @@ impl AppData {
     /// amount back. Amounts are *added* rather than overwritten so that
     /// transactions applied after the drain are preserved.
     pub fn restore_balances(&self, snapshot: &[(u32, Decimal)]) -> Result<(), ApiError> {
-        let mut state = self.write()?;
+        let mut registry = self.write()?;
         for (client_id, amount) in snapshot {
-            if let Some(client) = state.clients.get_mut(client_id) {
+            if let Some(client) = registry.clients.get_mut(client_id) {
                 client.balance += *amount;
             }
         }
