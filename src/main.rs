@@ -24,12 +24,14 @@ async fn main() -> std::io::Result<()> {
             // Malformed JSON bodies / query strings would otherwise return
             // actix's plain-text 400; route them through `ApiError` so every
             // error response shares the same JSON shape.
-            .app_data(web::JsonConfig::default().error_handler(|err, _req| {
-                ApiError::Validation(err.to_string()).into()
-            }))
-            .app_data(web::QueryConfig::default().error_handler(|err, _req| {
-                ApiError::Validation(err.to_string()).into()
-            }))
+            .app_data(
+                web::JsonConfig::default()
+                    .error_handler(|err, _req| ApiError::Validation(err.to_string()).into()),
+            )
+            .app_data(
+                web::QueryConfig::default()
+                    .error_handler(|err, _req| ApiError::Validation(err.to_string()).into()),
+            )
             .wrap(Logger::default())
             .service(handlers::new_client)
             .service(handlers::new_credit_transaction)

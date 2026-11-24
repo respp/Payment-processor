@@ -19,7 +19,10 @@ pub enum ApiError {
     DuplicateDocument(String),
 
     #[error("insufficient funds: balance is {balance}, debit requested is {requested}")]
-    InsufficientFunds { balance: Decimal, requested: Decimal },
+    InsufficientFunds {
+        balance: Decimal,
+        requested: Decimal,
+    },
 
     #[error("failed to persist balances: {0}")]
     Persistence(#[from] std::io::Error),
